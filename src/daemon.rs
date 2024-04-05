@@ -10,7 +10,9 @@ use serde_json::{json, Value};
 
 use std::fs::File;
 use std::io::Read;
+use std::ops::Add;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::{
     chain::{Chain, NewHeader},
@@ -23,10 +25,29 @@ use crate::{
 
 enum PollResult {
     Done(Result<()>),
-    Retry,
+    Retry {
+        wait_time: Duration,
+        max_daemon_retries: Option<usize>,
+        result: Result<()>,
+    },
 }
 
-fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
+impl Default for PollResult {
+    fn default() -> Self {
+        Self::Retry {
+            wait_time: Duration::from_secs(1),
+            max_daemon_retries: None,
+            result: Ok(()),
+        }
+    }
+}
+
+fn rpc_poll(
+    client: &mut Client,
+    skip_block_download_wait: bool,
+    wait_time: Duration,
+    max_daemon_retries: Option<usize>,
+) -> PollResult {
     match client.get_blockchain_info() {
         Ok(info) => {
             if skip_block_download_wait {
@@ -44,7 +65,7 @@ fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
                         ""
                     }
                 );
-                return PollResult::Retry;
+                return PollResult::default();
             }
             PollResult::Done(Ok(()))
         }
@@ -52,10 +73,15 @@ fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
             if let Some(e) = extract_bitcoind_error(&err) {
                 if e.code == -28 {
                     debug!("waiting for RPC warmup: {}", e.message);
-                    return PollResult::Retry;
+                    return PollResult::default();
                 }
             }
-            PollResult::Done(Err(err).context("daemon not available"))
+
+            PollResult::Retry {
+                wait_time,
+                max_daemon_retries,
+                result: Ok(()),
+            }
         }
     }
 }
@@ -111,17 +137,66 @@ impl Daemon {
     ) -> Result<Self> {
         let mut rpc = rpc_connect(config)?;
 
+        let mut retry_count = 0usize;
+
         loop {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match rpc_poll(&mut rpc, config.skip_block_download_wait) {
+            match rpc_poll(
+                &mut rpc,
+                config.skip_block_download_wait,
+                config.wait_duration,
+                config.max_daemon_retries,
+            ) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
                 }
-                PollResult::Retry => {
-                    std::thread::sleep(std::time::Duration::from_secs(1)); // wait a bit before polling
+                PollResult::Retry {
+                    wait_time,
+                    max_daemon_retries,
+                    result,
+                } => {
+                    if let Some(has_max_retries) = max_daemon_retries {
+                        dbg!("HERE1");
+
+                        loop {
+                            dbg!("HERE2");
+
+                            if retry_count.lt(&has_max_retries) {
+                                dbg!("HERE3");
+
+                                if retry_count.eq(&0) {
+                                    dbg!("HERE4");
+
+                                    error!(
+                                        "Bitcoind daemon not available. Retrying in {} second(s)",
+                                        wait_time.as_secs()
+                                    );
+                                } else {
+                                    dbg!("HERE5");
+
+                                    error!("Bitcoind daemon not available. Retried {} times. Retrying in {} second(s)", retry_count, wait_time.as_secs());
+
+                                    std::thread::sleep(wait_time); //TODO improve on 0 secs retry
+
+                                    retry_count = retry_count.add(1);
+                                }
+                            }
+
+                            if retry_count.eq(&has_max_retries) {
+                                dbg!("HERE6");
+
+                                std::thread::sleep(std::time::Duration::from_secs(1));
+                                result.context("daemon not available")?;
+                                break;
+                            }
+                        }
+                    } else {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        // wait a bit before polling
+                    }
                 }
             }
         }

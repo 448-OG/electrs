@@ -147,6 +147,9 @@ pub struct Config {
     pub server_banner: String,
     pub signet_magic: Magic,
     pub args: Vec<String>,
+    /// Maximum number of retries the RPC connection to `bitcoind` will be retried
+    /// in case the connection is lost
+    pub max_daemon_retries: Option<usize>,
 }
 
 pub struct SensitiveAuth(pub Auth);
@@ -354,6 +357,7 @@ impl Config {
             disable_electrum_rpc: config.disable_electrum_rpc,
             server_banner: config.server_banner,
             signet_magic: magic,
+            max_daemon_retries: config.max_daemon_retries,
             args: args.map(|a| a.into_string().unwrap()).collect(),
         };
         eprintln!(
