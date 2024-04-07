@@ -149,7 +149,7 @@ pub struct Config {
     pub args: Vec<String>,
     /// Maximum number of retries the RPC connection to `bitcoind` will be retried
     /// in case the connection is lost
-    pub max_daemon_retries: Option<usize>,
+    pub max_daemon_retries: usize,
 }
 
 pub struct SensitiveAuth(pub Auth);

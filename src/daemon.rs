@@ -12,7 +12,6 @@ use std::fs::File;
 use std::io::Read;
 use std::ops::Add;
 use std::path::Path;
-use std::time::Duration;
 
 use crate::{
     chain::{Chain, NewHeader},
@@ -25,29 +24,11 @@ use crate::{
 
 enum PollResult {
     Done(Result<()>),
-    Retry {
-        wait_time: Duration,
-        max_daemon_retries: Option<usize>,
-        result: Result<()>,
-    },
+    Retry,
+    RetryDaemon(Result<()>),
 }
 
-impl Default for PollResult {
-    fn default() -> Self {
-        Self::Retry {
-            wait_time: Duration::from_secs(1),
-            max_daemon_retries: None,
-            result: Ok(()),
-        }
-    }
-}
-
-fn rpc_poll(
-    client: &mut Client,
-    skip_block_download_wait: bool,
-    wait_time: Duration,
-    max_daemon_retries: Option<usize>,
-) -> PollResult {
+fn rpc_poll(client: &mut Client, skip_block_download_wait: bool) -> PollResult {
     match client.get_blockchain_info() {
         Ok(info) => {
             if skip_block_download_wait {
@@ -65,7 +46,7 @@ fn rpc_poll(
                         ""
                     }
                 );
-                return PollResult::default();
+                return PollResult::Retry;
             }
             PollResult::Done(Ok(()))
         }
@@ -73,15 +54,11 @@ fn rpc_poll(
             if let Some(e) = extract_bitcoind_error(&err) {
                 if e.code == -28 {
                     debug!("waiting for RPC warmup: {}", e.message);
-                    return PollResult::default();
+                    return PollResult::Retry;
                 }
             }
 
-            PollResult::Retry {
-                wait_time,
-                max_daemon_retries,
-                result: Ok(()),
-            }
+            PollResult::RetryDaemon(Ok(()))
         }
     }
 }
@@ -136,68 +113,55 @@ impl Daemon {
         metrics: &Metrics,
     ) -> Result<Self> {
         let mut rpc = rpc_connect(config)?;
+        'outer: loop {
+            let mut retry_count = 0usize;
 
-        let mut retry_count = 0usize;
-
-        loop {
             exit_flag
                 .poll()
                 .context("bitcoin RPC polling interrupted")?;
-            match rpc_poll(
-                &mut rpc,
-                config.skip_block_download_wait,
-                config.wait_duration,
-                config.max_daemon_retries,
-            ) {
+
+            match rpc_poll(&mut rpc, config.skip_block_download_wait) {
                 PollResult::Done(result) => {
                     result.context("bitcoind RPC polling failed")?;
                     break; // on success, finish polling
                 }
-                PollResult::Retry {
-                    wait_time,
-                    max_daemon_retries,
-                    result,
-                } => {
-                    if let Some(has_max_retries) = max_daemon_retries {
-                        dbg!("HERE1");
-
-                        loop {
-                            dbg!("HERE2");
-
-                            if retry_count.lt(&has_max_retries) {
-                                dbg!("HERE3");
-
-                                if retry_count.eq(&0) {
-                                    dbg!("HERE4");
-
-                                    error!(
-                                        "Bitcoind daemon not available. Retrying in {} second(s)",
-                                        wait_time.as_secs()
-                                    );
-                                } else {
-                                    dbg!("HERE5");
-
-                                    error!("Bitcoind daemon not available. Retried {} times. Retrying in {} second(s)", retry_count, wait_time.as_secs());
-
-                                    std::thread::sleep(wait_time); //TODO improve on 0 secs retry
-
-                                    retry_count = retry_count.add(1);
-                                }
-                            }
-
-                            if retry_count.eq(&has_max_retries) {
-                                dbg!("HERE6");
-
-                                std::thread::sleep(std::time::Duration::from_secs(1));
-                                result.context("daemon not available")?;
-                                break;
+                PollResult::Retry => {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    // wait a bit before polling
+                }
+                PollResult::RetryDaemon(result) => loop {
+                    if !config.max_daemon_retries.eq(&0) {
+                        if retry_count.lt(&config.max_daemon_retries) {
+                            if retry_count.eq(&0) {
+                                error!(
+                                    "Bitcoind daemon not available. Retrying in {} second(s)",
+                                    config.wait_duration.as_secs()
+                                );
+                            } else {
+                                error!("Bitcoind daemon not available. Retried {} times. Retrying in {} second(s)", retry_count, config.wait_duration.as_secs());
                             }
                         }
-                    } else {
-                        std::thread::sleep(std::time::Duration::from_secs(1));
-                        // wait a bit before polling
+
+                        if retry_count.eq(&config.max_daemon_retries) {
+                            error!("Max Retries Reached");
+
+                            result.context("daemon not available")?;
+                            break 'outer;
+                        }
                     }
-                }
+
+                    std::thread::sleep(config.wait_duration);
+
+                    retry_count = retry_count.add(1);
+
+                    if let Ok(new_client) = rpc_connect(config) {
+                        info!("Connection to Bitcoin Core Re-established");
+                        rpc = new_client;
+
+                        rpc.get_blockchain_info()?;
+                        break 'outer;
+                    }
+                },
             }
         }
 
@@ -219,6 +183,7 @@ impl Daemon {
             metrics,
             config.signet_magic,
         )?);
+
         Ok(Self { p2p, rpc })
     }
 
